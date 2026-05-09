@@ -576,6 +576,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 			peekBytes, _ = conn.Peek(conn.Buffered())
 			_, err = remoteConn.Write(peekBytes)
 			if err != nil {
+				_ = remoteConn.Close()
 				return
 			}
 			if peekLen = len(peekBytes); peekLen > 0 {
