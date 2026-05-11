@@ -173,6 +173,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewTrustTunnel(*trustTunnelOption)
+	case "encrypted-proxy":
+		epOption := &outbound.EncryptedProxyOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, epOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewEncryptedProxy(*epOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
