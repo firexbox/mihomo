@@ -148,6 +148,13 @@ func ParseListener(mapping map[string]any) (C.InboundListener, error) {
 			return nil, err
 		}
 		listener, err = IN.NewTrustTunnel(trusttunnelOption)
+	case "encrypted-proxy":
+		encryptedProxyOption := &IN.EncryptedProxyOption{}
+		err = decoder.Decode(mapping, encryptedProxyOption)
+		if err != nil {
+			return nil, err
+		}
+		listener, err = IN.NewEncryptedProxy(encryptedProxyOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}

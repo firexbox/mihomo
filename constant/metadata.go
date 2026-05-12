@@ -41,6 +41,7 @@ const (
 	MIERU
 	SUDOKU
 	TRUSTTUNNEL
+	ENCRYPTEDPROXY
 	INNER
 )
 
@@ -118,6 +119,8 @@ func (t Type) String() string {
 		return "Sudoku"
 	case TRUSTTUNNEL:
 		return "TrustTunnel"
+	case ENCRYPTEDPROXY:
+		return "EncryptedProxy"
 	case INNER:
 		return "Inner"
 	default:
@@ -164,6 +167,8 @@ func ParseType(t string) (*Type, error) {
 		res = SUDOKU
 	case "TRUSTTUNNEL":
 		res = TRUSTTUNNEL
+	case "ENCRYPTEDPROXY":
+		res = ENCRYPTEDPROXY
 	case "INNER":
 		res = INNER
 	default:
