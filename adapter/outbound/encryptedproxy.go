@@ -16,6 +16,7 @@ import (
 	"time"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/sing/common/uot"
 )
 
 // ─── EncryptedProxy 出站协议 ─────────────────────────────────────────────────
@@ -51,9 +52,6 @@ const (
 	epMaxPaddingSize  = 255
 	epMaxPlainSize    = epMaxFrameSize - epTagSize - 1 - epMaxPaddingSize
 	epJitterMaxMicros = 50000
-	epDefaultPoolSize = 5
-	epMaxPoolSize     = 32
-	epPoolDialTimeout = 5 * time.Second
 )
 
 const (
@@ -82,143 +80,6 @@ type EncryptedProxy struct {
 	option   *EncryptedProxyOption
 	key      []byte
 	obfKey   []byte
-	pool     *epConnPool
-}
-
-// ─── 连接池 ──────────────────────────────────────────────────────────────────
-
-type epConnPool struct {
-	remoteAddr string
-	key        []byte
-	obfs       bool
-	jitter     bool
-	dialer     C.Dialer
-
-	ch     chan *epCryptoConn
-	size   int
-	mu     sync.Mutex
-	closed bool
-	wg     sync.WaitGroup
-}
-
-func newEPConnPool(ep *EncryptedProxy) *epConnPool {
-	size := ep.option.PoolSize
-	if size <= 0 {
-		size = epDefaultPoolSize
-	}
-	if size > epMaxPoolSize {
-		size = epMaxPoolSize
-	}
-
-	p := &epConnPool{
-		remoteAddr: net.JoinHostPort(ep.option.Server, strconv.Itoa(ep.option.Port)),
-		key:        ep.key,
-		obfs:       ep.option.Obfs,
-		jitter:     ep.option.Jitter,
-		dialer:     ep.dialer,
-		ch:         make(chan *epCryptoConn, size),
-		size:       size,
-	}
-
-	// 预热
-	for i := 0; i < size; i++ {
-		p.wg.Add(1)
-		go p.warmUp()
-	}
-
-	return p
-}
-
-func (p *epConnPool) warmUp() {
-	defer p.wg.Done()
-
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	p.mu.Unlock()
-
-	conn, err := p.dial()
-	if err != nil {
-		return
-	}
-
-	p.mu.Lock()
-	if p.closed {
-		conn.rawConn.Close()
-		p.mu.Unlock()
-		return
-	}
-	p.mu.Unlock()
-
-	select {
-	case p.ch <- conn:
-	default:
-		conn.rawConn.Close()
-	}
-}
-
-func (p *epConnPool) dial() (*epCryptoConn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), epPoolDialTimeout)
-	defer cancel()
-
-	rawConn, err := p.dialer.DialContext(ctx, "tcp", p.remoteAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true)
-		tcpConn.SetKeepAlive(true)
-		tcpConn.SetKeepAlivePeriod(30 * time.Second)
-	}
-
-	cryptoConn, err := newEPClientConn(rawConn, p.key, p.obfs, p.jitter)
-	if err != nil {
-		rawConn.Close()
-		return nil, err
-	}
-
-	return cryptoConn, nil
-}
-
-func (p *epConnPool) Get() (*epCryptoConn, error) {
-	select {
-	case conn := <-p.ch:
-		// 异步补充
-		p.mu.Lock()
-		if !p.closed {
-			p.wg.Add(1)
-			go p.warmUp()
-		}
-		p.mu.Unlock()
-		return conn, nil
-	default:
-		// 池空，新建
-		c, err := p.dial()
-
-		p.mu.Lock()
-		if !p.closed {
-			p.wg.Add(1)
-			go p.warmUp()
-		}
-		p.mu.Unlock()
-
-		return c, err
-	}
-}
-
-func (p *epConnPool) Close() {
-	p.mu.Lock()
-	p.closed = true
-	p.mu.Unlock()
-
-	p.wg.Wait()
-	close(p.ch)
-	for conn := range p.ch {
-		conn.rawConn.Close()
-	}
 }
 
 // ─── 加密连接 ────────────────────────────────────────────────────────────────
@@ -573,9 +434,32 @@ func epRandomJitter(maxMicros int) {
 
 // ─── mihomo ProxyAdapter 接口实现 ────────────────────────────────────────────
 
+// dialConnection 建立到加密代理服务端的新连接
+func (ep *EncryptedProxy) dialConnection(ctx context.Context) (*epCryptoConn, error) {
+	remoteAddr := net.JoinHostPort(ep.option.Server, strconv.Itoa(ep.option.Port))
+	rawConn, err := ep.dialer.DialContext(ctx, "tcp", remoteAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	if tcpConn, ok := rawConn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	cryptoConn, err := newEPClientConn(rawConn, ep.key, ep.option.Obfs, ep.option.Jitter)
+	if err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+
+	return cryptoConn, nil
+}
+
 // DialContext 建立加密连接并发送目标地址头。
 func (ep *EncryptedProxy) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	cryptoConn, err := ep.pool.Get()
+	cryptoConn, err := ep.dialConnection(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%s 连接加密代理失败: %w", ep.addr, err)
 	}
@@ -603,6 +487,46 @@ func (ep *EncryptedProxy) DialContext(ctx context.Context, metadata *C.Metadata)
 	return NewConn(cryptoConn, ep), nil
 }
 
+// ListenPacketContext 实现 UDP over TCP（gateway 模式 DNS 需要）
+func (ep *EncryptedProxy) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
+	if err := ep.ResolveUDP(ctx, metadata); err != nil {
+		return nil, err
+	}
+
+	cryptoConn, err := ep.dialConnection(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%s 连接加密代理失败: %w", ep.addr, err)
+	}
+
+	host := metadata.Host
+	port := int(metadata.DstPort)
+	if port == 0 {
+		port = 443
+	}
+	if host == "" {
+		host = metadata.DstIP.String()
+	}
+
+	if err := epEncodeAddr(cryptoConn, host, port); err != nil {
+		cryptoConn.Close()
+		return nil, fmt.Errorf("发送协议头失败: %w", err)
+	}
+
+	destination := uot.RequestDestination(uot.Version)
+	pc := uot.NewLazyConn(cryptoConn, uot.Request{Destination: destination})
+	return newPacketConn(pc, ep), nil
+}
+
+// SupportUOT 实现 UDP over TCP 支持
+func (ep *EncryptedProxy) SupportUOT() bool {
+	return true
+}
+
+// Unwrap 返回 nil，与 trojan/shadowsocks 等协议一致
+func (ep *EncryptedProxy) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+	return nil
+}
+
 // ProxyInfo implements C.ProxyAdapter
 func (ep *EncryptedProxy) ProxyInfo() C.ProxyInfo {
 	info := ep.Base.ProxyInfo()
@@ -611,9 +535,6 @@ func (ep *EncryptedProxy) ProxyInfo() C.ProxyInfo {
 }
 
 func (ep *EncryptedProxy) Close() error {
-	if ep.pool != nil {
-		ep.pool.Close()
-	}
 	return nil
 }
 
@@ -641,7 +562,6 @@ func NewEncryptedProxy(option EncryptedProxyOption) (*EncryptedProxy, error) {
 	}
 
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
-	outbound.pool = newEPConnPool(outbound)
 
 	return outbound, nil
 }
